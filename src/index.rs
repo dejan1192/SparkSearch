@@ -18,6 +18,7 @@ pub enum EntryKind {
     StartMenu,
     PathExecutable,
     BuiltIn,
+    Bookmark,
 }
 
 pub fn index_entries() -> Vec<LauncherEntry> {

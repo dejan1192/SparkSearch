@@ -3031,6 +3031,7 @@ dependencies = [
  "eframe",
  "image",
  "raw-window-handle 0.6.2",
+ "serde_json",
  "ureq",
  "windows-sys 0.59.0",
 ]

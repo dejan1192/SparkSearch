@@ -27,8 +27,14 @@ impl LaunchTarget {
     }
 }
 
-pub fn is_terminal_command(command: &str) -> bool {
-    terminal_command_text(command).is_some()
+pub fn terminal_command_display(command: &str) -> Option<&str> {
+    let command = terminal_command_text(command)?;
+
+    if command.trim().is_empty() {
+        None
+    } else {
+        Some(command.trim())
+    }
 }
 
 pub fn launch(target: &LaunchTarget, mode: LaunchMode) -> Result<(), String> {

@@ -139,6 +139,41 @@ impl ShortcutConfig {
             .get(shortcut)
             .map(|command| command.target.as_str())
     }
+
+    pub fn has_search_target(&self, shortcut: &str) -> bool {
+        self.commands
+            .get(shortcut)
+            .and_then(|command| command.search_target.as_ref())
+            .is_some()
+    }
+
+    pub fn best_matching_shortcut(&self, query: &str) -> Option<String> {
+        let query = query.trim();
+        if !query.starts_with('!') || query.chars().any(char::is_whitespace) {
+            return None;
+        }
+
+        if self.commands.contains_key(query) {
+            return Some(query.to_string());
+        }
+
+        let preferred = ["!g", "!d", "!git", "!y", "!gpt", "!claude"];
+        if let Some(shortcut) = preferred
+            .iter()
+            .find(|shortcut| shortcut.starts_with(query) && self.commands.contains_key(**shortcut))
+        {
+            return Some((*shortcut).to_string());
+        }
+
+        let mut matches: Vec<_> = self
+            .commands
+            .keys()
+            .filter(|shortcut| shortcut.starts_with(query))
+            .cloned()
+            .collect();
+        matches.sort();
+        matches.into_iter().next()
+    }
 }
 
 fn shortcut_config_path() -> PathBuf {

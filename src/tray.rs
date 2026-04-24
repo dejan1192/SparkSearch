@@ -343,25 +343,28 @@ mod platform {
     }
 
     unsafe fn create_spark_icon(hinstance: windows_sys::Win32::Foundation::HINSTANCE) -> HICON {
-        let mut and_bits = vec![0xff; ICON_SIZE * ICON_SIZE / 8];
+        let rgba = crate::branding::spark_icon_rgba(ICON_SIZE as u32);
+        let mut and_bits = vec![0xff_u8; ICON_SIZE * ICON_SIZE / 8];
         let mut xor_bits = vec![0_u8; ICON_SIZE * ICON_SIZE * 4];
 
         for y in 0..ICON_SIZE {
             for x in 0..ICON_SIZE {
-                let dx = x as f32 - 15.5;
-                let dy = y as f32 - 15.5;
-                let distance = (dx * dx + dy * dy).sqrt();
-                if distance > 14.2 {
+                let src = (y * ICON_SIZE + x) * 4;
+                let r = rgba[src];
+                let g = rgba[src + 1];
+                let b = rgba[src + 2];
+                let a = rgba[src + 3];
+
+                if a < 16 {
                     continue;
                 }
 
                 set_mask_bit(&mut and_bits, x, y, false);
-                let (red, green, blue) = spark_icon_color(x, y, distance);
-                let pixel_index = ((ICON_SIZE - 1 - y) * ICON_SIZE + x) * 4;
-                xor_bits[pixel_index] = blue;
-                xor_bits[pixel_index + 1] = green;
-                xor_bits[pixel_index + 2] = red;
-                xor_bits[pixel_index + 3] = 255;
+                let dst = ((ICON_SIZE - 1 - y) * ICON_SIZE + x) * 4;
+                xor_bits[dst] = b;
+                xor_bits[dst + 1] = g;
+                xor_bits[dst + 2] = r;
+                xor_bits[dst + 3] = a;
             }
         }
 
@@ -373,31 +376,6 @@ mod platform {
             32,
             and_bits.as_ptr(),
             xor_bits.as_ptr(),
-        )
-    }
-
-    fn spark_icon_color(x: usize, y: usize, distance: f32) -> (u8, u8, u8) {
-        let dx = x as i32 - 16;
-        let dy = y as i32 - 15;
-        let spark = (dx.abs() <= 1 && dy.abs() <= 10)
-            || (dy.abs() <= 1 && dx.abs() <= 10)
-            || ((dx - dy).abs() <= 1 && dx.abs() <= 7 && dy.abs() <= 7)
-            || ((dx + dy).abs() <= 1 && dx.abs() <= 6 && dy.abs() <= 6);
-
-        if spark {
-            return (255, 255, 255);
-        }
-
-        if distance > 12.6 {
-            return (37, 45, 58);
-        }
-
-        let top_light = (14_i32.saturating_sub(y as i32).max(0) as u8).saturating_mul(3);
-        let left_blue = (14_i32.saturating_sub(x as i32).max(0) as u8).saturating_mul(2);
-        (
-            235_u8.saturating_add(top_light / 3),
-            101_u8.saturating_add(top_light),
-            47_u8.saturating_add(left_blue),
         )
     }
 

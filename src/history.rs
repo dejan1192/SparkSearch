@@ -193,4 +193,3 @@ fn unix_now() -> u64 {
 fn _history_path_for_tests(path: &Path) -> PathBuf {
     path.join("run-history.tsv")
 }
-

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::env;
+use std::fs;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -8,7 +11,7 @@ use eframe::egui;
 
 use crate::index::LauncherEntry;
 
-const ICON_SIZE: usize = 32;
+const ICON_SIZE: usize = 64;
 
 #[derive(Default)]
 pub struct AppIconCache {
@@ -45,12 +48,7 @@ impl Default for FaviconCache {
 }
 
 impl FaviconCache {
-    pub fn lookup(
-        &mut self,
-        ctx: &egui::Context,
-        shortcut: &str,
-        url: &str,
-    ) -> FaviconLookup {
+    pub fn lookup(&mut self, ctx: &egui::Context, shortcut: &str, url: &str) -> FaviconLookup {
         while let Ok((key, image)) = self.rx.try_recv() {
             let entry = match image {
                 Some(img) => FaviconState::Loaded(ctx.load_texture(
@@ -63,7 +61,13 @@ impl FaviconCache {
             self.state.insert(key, entry);
         }
 
-        let key = shortcut.to_string();
+        let Some(host) = host_from_url(url) else {
+            self.state
+                .insert(shortcut.to_string(), FaviconState::Failed);
+            return FaviconLookup::Unavailable;
+        };
+        let key = host.to_ascii_lowercase();
+
         match self.state.get(&key) {
             Some(FaviconState::Loaded(tex)) => return FaviconLookup::Ready(tex.clone()),
             Some(FaviconState::Pending) => return FaviconLookup::Loading,
@@ -71,16 +75,22 @@ impl FaviconCache {
             None => {}
         }
 
-        let Some(host) = host_from_url(url) else {
-            self.state.insert(key, FaviconState::Failed);
-            return FaviconLookup::Unavailable;
-        };
+        if let Some(image) = read_cached_favicon(&host) {
+            let texture = ctx.load_texture(
+                format!("favicon-{key}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.state
+                .insert(key.clone(), FaviconState::Loaded(texture.clone()));
+            return FaviconLookup::Ready(texture);
+        }
 
         self.state.insert(key.clone(), FaviconState::Pending);
         let tx = self.tx.clone();
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
-            let image = fetch_favicon(&host);
+            let image = fetch_cached_favicon(&host);
             let _ = tx.send((key, image));
             ctx_clone.request_repaint();
         });
@@ -101,7 +111,13 @@ fn host_from_url(url: &str) -> Option<String> {
     }
 }
 
-fn fetch_favicon(host: &str) -> Option<egui::ColorImage> {
+fn fetch_cached_favicon(host: &str) -> Option<egui::ColorImage> {
+    let path = favicon_cache_path(host);
+
+    if let Some(image) = read_cached_favicon(host) {
+        return Some(image);
+    }
+
     let url = format!("https://www.google.com/s2/favicons?domain={host}&sz=64");
     let response = ureq::builder()
         .timeout(Duration::from_secs(6))
@@ -115,12 +131,53 @@ fn fetch_favicon(host: &str) -> Option<egui::ColorImage> {
         .take(256 * 1024)
         .read_to_end(&mut bytes)
         .ok()?;
-    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, &bytes);
+
+    color_image_from_encoded_bytes(&bytes)
+}
+
+fn read_cached_favicon(host: &str) -> Option<egui::ColorImage> {
+    let bytes = fs::read(favicon_cache_path(host)).ok()?;
+    color_image_from_encoded_bytes(&bytes)
+}
+
+fn color_image_from_encoded_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
     let size = [decoded.width() as usize, decoded.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(
         size,
         decoded.as_raw(),
     ))
+}
+
+fn favicon_cache_path(host: &str) -> PathBuf {
+    let base = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("Spark Run").join("favicons"))
+        .unwrap_or_else(|| PathBuf::from("favicons"));
+    base.join(format!("{}.png", sanitize_cache_name(host)))
+}
+
+fn sanitize_cache_name(value: &str) -> String {
+    let mut output = String::new();
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            output.push(ch.to_ascii_lowercase());
+        } else {
+            output.push('_');
+        }
+    }
+
+    if output.is_empty() {
+        "site".to_string()
+    } else {
+        output
+    }
 }
 
 impl AppIconCache {
@@ -157,7 +214,7 @@ fn load_icon_image(path: &str) -> Option<egui::ColorImage> {
         },
         Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
         UI::{
-            Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON},
+            Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON},
             WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL},
         },
     };
@@ -170,7 +227,7 @@ fn load_icon_image(path: &str) -> Option<egui::ColorImage> {
             FILE_ATTRIBUTE_NORMAL,
             &mut shell_info,
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_SMALLICON,
+            SHGFI_ICON | SHGFI_LARGEICON,
         );
 
         if result == 0 || shell_info.hIcon.is_null() {

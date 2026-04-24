@@ -1,13 +1,15 @@
 mod actions;
-mod hotkey;
+mod bookmarks;
+mod branding;
 mod history;
+mod hotkey;
 mod icons;
 mod index;
 mod search;
 mod shortcuts;
 mod tray;
 
-use actions::{is_terminal_command, launch, target_from_raw_command, LaunchMode};
+use actions::{launch, target_from_raw_command, terminal_command_display, LaunchMode};
 use eframe::egui;
 use history::RunHistory;
 use hotkey::GlobalHotkey;
@@ -25,9 +27,18 @@ const WINDOW_EXPANDED_HEIGHT: f32 = 440.0;
 const WINDOW_WIDTH: f32 = 680.0;
 
 fn main() -> eframe::Result<()> {
+    const ICON_SIZE: u32 = 64;
+    let window_icon = egui::IconData {
+        rgba: branding::spark_icon_rgba(ICON_SIZE),
+        width: ICON_SIZE,
+        height: ICON_SIZE,
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Spark Run")
+            .with_title("Spark")
+            .with_app_id("Spark")
+            .with_icon(std::sync::Arc::new(window_icon))
             .with_inner_size([WINDOW_WIDTH, WINDOW_COLLAPSED_HEIGHT])
             .with_min_inner_size([480.0, 84.0])
             .with_resizable(false)
@@ -45,6 +56,7 @@ fn main() -> eframe::Result<()> {
 
 struct SparkRunApp {
     entries: Vec<LauncherEntry>,
+    bookmarks: Vec<LauncherEntry>,
     query: String,
     results: Vec<SearchResult>,
     selected: usize,
@@ -59,6 +71,8 @@ struct SparkRunApp {
     suppress_hotkey_input_frames: u8,
     window_expanded: bool,
     center_window_frames: u8,
+    ignore_focus_loss_frames: u8,
+    window_visible: bool,
     exit_requested: bool,
 }
 
@@ -67,6 +81,7 @@ impl SparkRunApp {
         configure_style(&cc.egui_ctx);
 
         let entries = index_entries();
+        let bookmarks = bookmarks::load_default_browser_bookmarks();
         let loaded_history = RunHistory::load();
         let results = search(&entries, "", RESULT_LIMIT, &loaded_history.history);
         let loaded_shortcuts = ShortcutConfig::load_or_create();
@@ -89,6 +104,7 @@ impl SparkRunApp {
 
         Self {
             entries,
+            bookmarks,
             query: String::new(),
             results,
             selected: 0,
@@ -103,12 +119,26 @@ impl SparkRunApp {
             suppress_hotkey_input_frames: 0,
             window_expanded: false,
             center_window_frames: 4,
+            ignore_focus_loss_frames: 4,
+            window_visible: true,
             exit_requested: false,
         }
     }
 
     fn refresh_results(&mut self) {
-        if is_terminal_command(&self.query) {
+        if terminal_command_display(&self.query).is_some() {
+            self.results.clear();
+            self.selected = 0;
+            return;
+        }
+
+        if let Some(filter) = bookmark_query_filter(&self.query) {
+            self.results = search(&self.bookmarks, filter, RESULT_LIMIT, &self.run_history);
+            self.selected = self.selected.min(self.results.len().saturating_sub(1));
+            return;
+        }
+
+        if shortcut_action_command(&self.query, &self.shortcuts).is_some() {
             self.results.clear();
             self.selected = 0;
             return;
@@ -135,8 +165,9 @@ impl SparkRunApp {
     }
 
     fn launch_selected(&mut self, mode: LaunchMode, ctx: &egui::Context) {
-        let target = if is_terminal_command(&self.query) {
-            target_from_raw_command(&self.query, &self.shortcuts)
+        let target = if let Some(command) = action_command_to_execute(&self.query, &self.shortcuts)
+        {
+            target_from_raw_command(&command, &self.shortcuts)
         } else if let Some(entry) = self.selected_entry() {
             entry.target.clone()
         } else {
@@ -168,12 +199,15 @@ impl SparkRunApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.focus_search = true;
         self.center_window_frames = 4;
+        self.ignore_focus_loss_frames = 4;
+        self.window_visible = true;
     }
 
     fn hide_to_background(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.focus_search = true;
+        self.window_visible = false;
     }
 
     fn handle_global_hotkey(&mut self, ctx: &egui::Context) {
@@ -258,11 +292,32 @@ impl SparkRunApp {
         }
 
         if let Some(index) = alt_number_pressed(ctx) {
+            if index == 0 && action_command_to_execute(&self.query, &self.shortcuts).is_some() {
+                self.launch_selected(LaunchMode::Normal, ctx);
+                return;
+            }
+
             let visible = self.results.len().min(MAX_VISIBLE_RESULTS);
             if index < visible {
                 self.selected = index;
                 self.launch_selected(LaunchMode::Normal, ctx);
             }
+        }
+    }
+
+    fn handle_focus_loss(&mut self, ctx: &egui::Context) {
+        if !self.window_visible || self.exit_requested {
+            return;
+        }
+
+        if self.ignore_focus_loss_frames > 0 {
+            self.ignore_focus_loss_frames -= 1;
+            return;
+        }
+
+        let lost_focus = ctx.input(|input| input.viewport().focused == Some(false));
+        if lost_focus {
+            self.hide_to_background(ctx);
         }
     }
 
@@ -318,6 +373,7 @@ impl eframe::App for SparkRunApp {
         }
 
         self.suppress_hotkey_input(ctx);
+        self.handle_focus_loss(ctx);
         self.handle_keyboard(ctx);
 
         egui::CentralPanel::default()
@@ -341,15 +397,32 @@ impl eframe::App for SparkRunApp {
                             self.refresh_results();
                         }
 
-                        if should_show_results(&self.query, &self.shortcuts)
-                            && !self.results.is_empty()
-                        {
+                        let action_preview = action_preview(&self.query, &self.shortcuts);
+                        let show_results = should_show_results(&self.query, &self.shortcuts)
+                            && (action_preview.is_some() || !self.results.is_empty());
+
+                        if show_results {
                             ui.add_space(10.0);
-                            let mut pending_launch: Option<usize> = None;
+                            let mut pending_launch: Option<Option<usize>> = None;
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
+
+                                    if let Some(preview) = action_preview {
+                                        let response = draw_action_result(
+                                            ui,
+                                            &preview,
+                                            self.results.is_empty(),
+                                            &mut self.favicon_cache,
+                                            ctx,
+                                        );
+
+                                        if response.double_clicked() {
+                                            pending_launch = Some(None);
+                                        }
+                                    }
+
                                     for index in 0..self.results.len().min(MAX_VISIBLE_RESULTS) {
                                         let selected = index == self.selected;
                                         let result = self.results[index].clone();
@@ -359,6 +432,7 @@ impl eframe::App for SparkRunApp {
                                             selected,
                                             index,
                                             &mut self.icon_cache,
+                                            &mut self.favicon_cache,
                                             ctx,
                                         );
 
@@ -367,13 +441,15 @@ impl eframe::App for SparkRunApp {
                                         }
 
                                         if response.double_clicked() {
-                                            pending_launch = Some(index);
+                                            pending_launch = Some(Some(index));
                                         }
                                     }
                                 });
 
                             if let Some(index) = pending_launch {
-                                self.selected = index;
+                                if let Some(index) = index {
+                                    self.selected = index;
+                                }
                                 self.launch_selected(LaunchMode::Normal, ctx);
                             }
                         }
@@ -393,6 +469,7 @@ fn draw_result(
     selected: bool,
     index: usize,
     icon_cache: &mut AppIconCache,
+    favicon_cache: &mut FaviconCache,
     ctx: &egui::Context,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
@@ -419,7 +496,15 @@ fn draw_result(
     }
 
     let icon_center = egui::pos2(rect.left() + 40.0, rect.center().y);
-    if let Some(texture) = icon_cache.texture_for(ctx, &result.entry) {
+    if let Some(texture) = website_texture_for(ctx, &result.entry, favicon_cache) {
+        let icon_rect = egui::Rect::from_center_size(icon_center, egui::vec2(32.0, 32.0));
+        painter.image(
+            texture.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else if let Some(texture) = icon_cache.texture_for(ctx, &result.entry) {
         let icon_rect = egui::Rect::from_center_size(icon_center, egui::vec2(32.0, 32.0));
         painter.image(
             texture.id(),
@@ -468,6 +553,225 @@ fn draw_result(
     response
 }
 
+fn website_texture_for(
+    ctx: &egui::Context,
+    entry: &LauncherEntry,
+    favicon_cache: &mut FaviconCache,
+) -> Option<egui::TextureHandle> {
+    if !matches!(entry.kind, EntryKind::Bookmark) && !entry.target.file.starts_with("http") {
+        return None;
+    }
+
+    match favicon_cache.lookup(ctx, &entry.target.file, &entry.target.file) {
+        FaviconLookup::Ready(texture) => Some(texture),
+        FaviconLookup::Loading => {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            None
+        }
+        FaviconLookup::Unavailable => None,
+    }
+}
+
+struct ActionPreview {
+    title: String,
+    subtitle: String,
+    icon: ActionIcon,
+}
+
+enum ActionIcon {
+    Terminal,
+    Favicon { shortcut: String, url: String },
+}
+
+fn draw_action_result(
+    ui: &mut egui::Ui,
+    preview: &ActionPreview,
+    selected: bool,
+    favicon_cache: &mut FaviconCache,
+    ctx: &egui::Context,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), RESULT_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter_at(rect);
+
+    let bg = if selected {
+        egui::Color32::from_rgb(32, 36, 44)
+    } else if response.hovered() {
+        egui::Color32::from_rgb(26, 29, 35)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 8.0, bg);
+
+    if selected {
+        let bar = egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(4.0, 9.0),
+            egui::pos2(rect.left() + 7.0, rect.bottom() - 9.0),
+        );
+        painter.rect_filled(bar, 1.5, egui::Color32::from_rgb(82, 156, 255));
+    }
+
+    let icon_center = egui::pos2(rect.left() + 40.0, rect.center().y);
+    match &preview.icon {
+        ActionIcon::Terminal => paint_terminal_icon(&painter, icon_center),
+        ActionIcon::Favicon { shortcut, url } => match favicon_cache.lookup(ctx, shortcut, url) {
+            FaviconLookup::Ready(texture) => {
+                let icon_rect = egui::Rect::from_center_size(icon_center, egui::vec2(32.0, 32.0));
+                painter.image(
+                    texture.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            FaviconLookup::Loading => {
+                paint_spinner(&painter, icon_center, ui.input(|input| input.time));
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            FaviconLookup::Unavailable => {
+                painter.circle_filled(icon_center, 17.0, egui::Color32::from_rgb(58, 64, 76));
+                painter.text(
+                    icon_center,
+                    egui::Align2::CENTER_CENTER,
+                    shortcut.trim_start_matches('!').to_uppercase(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        },
+    }
+
+    let text_left = icon_center.x + 26.0;
+    painter.text(
+        egui::pos2(text_left, rect.center().y - 10.0),
+        egui::Align2::LEFT_CENTER,
+        &preview.title,
+        egui::FontId::proportional(15.0),
+        egui::Color32::from_rgb(236, 238, 244),
+    );
+    painter.text(
+        egui::pos2(text_left, rect.center().y + 10.0),
+        egui::Align2::LEFT_CENTER,
+        &preview.subtitle,
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(138, 144, 158),
+    );
+
+    let pill = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 62.0, rect.center().y - 11.0),
+        egui::pos2(rect.right() - 12.0, rect.center().y + 11.0),
+    );
+    painter.rect_filled(pill, 4.0, egui::Color32::from_rgb(46, 50, 60));
+    painter.text(
+        pill.center(),
+        egui::Align2::CENTER_CENTER,
+        "Alt+1",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(186, 192, 205),
+    );
+
+    response
+}
+
+fn paint_terminal_icon(painter: &egui::Painter, center: egui::Pos2) {
+    let rect = egui::Rect::from_center_size(center, egui::vec2(34.0, 30.0));
+    painter.rect_filled(rect, 5.0, egui::Color32::from_rgb(70, 74, 82));
+    painter.rect_stroke(
+        rect.shrink(1.0),
+        5.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 102, 114)),
+    );
+
+    let stroke = egui::Stroke::new(2.2, egui::Color32::from_rgb(234, 237, 243));
+    let left = rect.left() + 8.0;
+    let mid_y = rect.center().y - 1.0;
+    painter.line_segment(
+        [egui::pos2(left, mid_y - 6.0), egui::pos2(left + 6.0, mid_y)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(left, mid_y + 6.0), egui::pos2(left + 6.0, mid_y)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 19.0, rect.center().y + 7.0),
+            egui::pos2(rect.right() - 7.0, rect.center().y + 7.0),
+        ],
+        stroke,
+    );
+}
+
+fn action_preview(query: &str, shortcuts: &ShortcutConfig) -> Option<ActionPreview> {
+    if let Some(command) = terminal_command_display(query) {
+        return Some(ActionPreview {
+            title: command.to_string(),
+            subtitle: "Execute command through command shell".to_string(),
+            icon: ActionIcon::Terminal,
+        });
+    }
+
+    let command = shortcut_action_command(query, shortcuts)?;
+    let shortcut = command.split_whitespace().next().unwrap_or_default();
+    let target = shortcuts.target_for_shortcut(shortcut)?.to_string();
+    let title = query.trim().to_string();
+    let subtitle = shortcut_subtitle(shortcut, command.contains(char::is_whitespace), shortcuts);
+
+    Some(ActionPreview {
+        title,
+        subtitle,
+        icon: ActionIcon::Favicon {
+            shortcut: shortcut.to_string(),
+            url: target,
+        },
+    })
+}
+
+fn action_command_to_execute(query: &str, shortcuts: &ShortcutConfig) -> Option<String> {
+    if terminal_command_display(query).is_some() {
+        return Some(query.trim().to_string());
+    }
+
+    shortcut_action_command(query, shortcuts)
+}
+
+fn shortcut_action_command(query: &str, shortcuts: &ShortcutConfig) -> Option<String> {
+    let trimmed = query.trim();
+    if !trimmed.starts_with('!') || bookmark_query_filter(trimmed).is_some() {
+        return None;
+    }
+
+    if trimmed.contains(char::is_whitespace) {
+        return shortcuts.resolve(trimmed).map(|_| trimmed.to_string());
+    }
+
+    shortcuts.best_matching_shortcut(trimmed)
+}
+
+fn shortcut_subtitle(shortcut: &str, has_query: bool, shortcuts: &ShortcutConfig) -> String {
+    let service = shortcut_service_name(shortcut);
+
+    if has_query && shortcuts.has_search_target(shortcut) {
+        format!("Search {service}")
+    } else {
+        format!("Open {service}")
+    }
+}
+
+fn shortcut_service_name(shortcut: &str) -> String {
+    match shortcut {
+        "!g" => "Google".to_string(),
+        "!d" => "DuckDuckGo".to_string(),
+        "!git" => "GitHub".to_string(),
+        "!y" => "YouTube".to_string(),
+        "!gpt" => "ChatGPT".to_string(),
+        "!claude" => "Claude".to_string(),
+        _ => shortcut.trim_start_matches('!').to_string(),
+    }
+}
+
 fn should_show_results(query: &str, shortcuts: &ShortcutConfig) -> bool {
     let query = query.trim();
 
@@ -475,11 +779,19 @@ fn should_show_results(query: &str, shortcuts: &ShortcutConfig) -> bool {
         return false;
     }
 
-    if is_terminal_command(query) {
-        return false;
+    if terminal_command_display(query).is_some() {
+        return true;
+    }
+
+    if bookmark_query_filter(query).is_some() {
+        return true;
     }
 
     if shortcuts.shortcut_prefix(query).is_some() {
+        return true;
+    }
+
+    if shortcut_action_command(query, shortcuts).is_some() {
         return true;
     }
 
@@ -545,14 +857,23 @@ fn entry_icon_palette(kind: EntryKind) -> (egui::Color32, egui::Color32) {
             egui::Color32::from_rgb(210, 128, 70),
             egui::Color32::from_rgb(255, 244, 232),
         ),
+        EntryKind::Bookmark => (
+            egui::Color32::from_rgb(226, 183, 70),
+            egui::Color32::from_rgb(45, 34, 10),
+        ),
     }
 }
 
 fn subtitle_for(entry: &LauncherEntry) -> String {
+    if matches!(entry.kind, EntryKind::Bookmark) {
+        return shorten_path(&entry.target.file, 72);
+    }
+
     let label = match entry.kind {
         EntryKind::BuiltIn => "Built-in command",
         EntryKind::StartMenu => "Start Menu shortcut",
         EntryKind::PathExecutable => "Executable on PATH",
+        EntryKind::Bookmark => "Bookmark",
     };
 
     let target = shorten_path(&entry.target.file, 48);
@@ -560,6 +881,17 @@ fn subtitle_for(entry: &LauncherEntry) -> String {
         label.to_string()
     } else {
         format!("{label} — {target}")
+    }
+}
+
+fn bookmark_query_filter(query: &str) -> Option<&str> {
+    let trimmed = query.trim_start();
+    if trimmed == "!b" {
+        Some("")
+    } else if let Some(rest) = trimmed.strip_prefix("!b ") {
+        Some(rest.trim())
+    } else {
+        None
     }
 }
 
@@ -684,7 +1016,11 @@ fn draw_plain_search_box(ui: &mut egui::Ui, query: &mut String, focus_search: &m
 
                 changed = response.changed();
 
-                draw_search_trailing(ui, query.is_empty());
+                draw_search_trailing(
+                    ui,
+                    query.is_empty(),
+                    terminal_command_display(query).is_some(),
+                );
             });
         });
 
@@ -757,22 +1093,26 @@ fn draw_shortcut_search_box(
                     changed = true;
                 }
 
-                draw_search_trailing(ui, text_after_shortcut.is_empty());
+                draw_search_trailing(ui, text_after_shortcut.is_empty(), false);
             });
         });
 
     changed
 }
 
-fn draw_search_trailing(ui: &mut egui::Ui, query_is_empty: bool) {
+fn draw_search_trailing(ui: &mut egui::Ui, query_is_empty: bool, terminal_mode: bool) {
     let clock_alpha = ui.ctx().animate_bool_with_time(
         egui::Id::new("spark_clock_alpha"),
-        query_is_empty,
+        query_is_empty && !terminal_mode,
         0.18,
     );
 
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        draw_magnifier_icon(ui, 18.0);
+        if terminal_mode {
+            draw_terminal_trailing_icon(ui, 26.0);
+        } else {
+            draw_magnifier_icon(ui, 18.0);
+        }
         if clock_alpha > 0.01 {
             ui.add_space(10.0);
             let alpha_byte = (clock_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -785,6 +1125,12 @@ fn draw_search_trailing(ui: &mut egui::Ui, query_is_empty: bool) {
             );
         }
     });
+}
+
+fn draw_terminal_trailing_icon(ui: &mut egui::Ui, size: f32) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    paint_terminal_icon(&painter, rect.center());
 }
 
 fn draw_magnifier_icon(ui: &mut egui::Ui, size: f32) {
@@ -871,21 +1217,13 @@ fn draw_shortcut_chip(
             );
         }
         FaviconLookup::Loading => {
-            painter.rect_filled(
-                rect.shrink(2.0),
-                6.0,
-                egui::Color32::from_rgb(44, 48, 57),
-            );
+            painter.rect_filled(rect.shrink(2.0), 6.0, egui::Color32::from_rgb(44, 48, 57));
             let time = ui.input(|input| input.time);
             paint_spinner(&painter, rect.center(), time);
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         FaviconLookup::Unavailable => {
-            painter.rect_filled(
-                rect.shrink(2.0),
-                6.0,
-                egui::Color32::from_rgb(44, 48, 57),
-            );
+            painter.rect_filled(rect.shrink(2.0), 6.0, egui::Color32::from_rgb(44, 48, 57));
         }
     }
 

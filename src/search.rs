@@ -70,6 +70,7 @@ fn executable_bonus(entry: &LauncherEntry) -> i32 {
     match (entry.kind, is_executable) {
         (EntryKind::PathExecutable, _) => 90,
         (EntryKind::BuiltIn, _) => 70,
+        (EntryKind::Bookmark, _) => 0,
         (_, true) => 60,
         (EntryKind::StartMenu, _) => 25,
     }
