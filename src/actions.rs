@@ -244,6 +244,7 @@ mod tests {
         for (shortcut, url) in [
             ("!gpt", "https://chatgpt.com/"),
             ("!claude", "https://claude.ai/"),
+            ("!kimi", "https://www.kimi.com/"),
         ] {
             let target = target_from_raw_command(shortcut, &shortcuts());
 

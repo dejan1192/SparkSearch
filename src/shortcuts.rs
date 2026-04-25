@@ -146,6 +146,11 @@ impl ShortcutConfig {
             .and_then(|command| command.search_target.as_ref())
             .is_some()
     }
+    pub fn all_shortcuts(&self) -> Vec<&str> {
+        let mut keys: Vec<_> = self.commands.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        keys
+    }
 
     pub fn best_matching_shortcut(&self, query: &str) -> Option<String> {
         let query = query.trim();

@@ -19,14 +19,14 @@ mod platform {
                 NIM_DELETE, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
             },
             WindowsAndMessaging::{
-                AppendMenuW, BringWindowToTop, CreateIcon, CreatePopupMenu, CreateWindowExW,
-                DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-                GetCursorPos, GetMessageW, LoadIconW, PostMessageW, PostThreadMessageW,
-                RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage,
-                CS_HREDRAW, CS_VREDRAW, HICON, IDI_APPLICATION, MF_STRING, MSG, SW_RESTORE,
-                SW_SHOW, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CLOSE,
-                WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NULL, WM_QUIT,
-                WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPED,
+                AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+                DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
+                GetMessageW, LoadIconW, PostMessageW, PostThreadMessageW, RegisterClassW,
+                SetForegroundWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+                HICON, IDI_APPLICATION, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_NONOTIFY,
+                TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                WM_USER, WNDCLASSW, WS_OVERLAPPED,
             },
         },
     };
@@ -39,7 +39,6 @@ mod platform {
     const MENU_EXIT_ID: usize = 1002;
 
     static TRAY_SENDER: OnceLock<Mutex<Option<mpsc::Sender<TrayEvent>>>> = OnceLock::new();
-    static APP_HWND: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum TrayEvent {
@@ -54,7 +53,7 @@ mod platform {
     }
 
     impl TrayIcon {
-        pub fn register(ctx: egui::Context, app_hwnd: Option<isize>) -> Result<Self, String> {
+        pub fn register(ctx: egui::Context, _app_hwnd: Option<isize>) -> Result<Self, String> {
             let (event_sender, receiver) = mpsc::channel();
             let (ready_sender, ready_receiver) = mpsc::channel();
 
@@ -64,8 +63,6 @@ mod platform {
                     .get_or_init(|| Mutex::new(None))
                     .lock()
                     .expect("tray sender mutex should not be poisoned") = Some(event_sender);
-                set_app_hwnd(app_hwnd);
-
                 let hinstance = GetModuleHandleW(null_mut()) as _;
                 let generated_icon = create_spark_icon(hinstance);
                 let tray_icon = if generated_icon.is_null() {
@@ -110,7 +107,6 @@ mod platform {
                         "Could not create tray icon window. Windows error code {code}."
                     )));
                     clear_sender();
-                    clear_app_hwnd();
                     destroy_generated_icon(generated_icon);
                     return;
                 }
@@ -120,7 +116,6 @@ mod platform {
                     let code = GetLastError();
                     DestroyWindow(hwnd);
                     clear_sender();
-                    clear_app_hwnd();
                     destroy_generated_icon(generated_icon);
                     let _ = ready_sender.send(Err(format!(
                         "Could not add Spark to the notification area. Windows error code {code}."
@@ -144,7 +139,6 @@ mod platform {
                 Shell_NotifyIconW(NIM_DELETE, &icon_data);
                 DestroyWindow(hwnd);
                 clear_sender();
-                clear_app_hwnd();
                 destroy_generated_icon(generated_icon);
             });
 
@@ -248,13 +242,6 @@ mod platform {
         }
     }
 
-    unsafe fn show_app_window(hwnd: HWND) {
-        ShowWindow(hwnd, SW_SHOW);
-        ShowWindow(hwnd, SW_RESTORE);
-        BringWindowToTop(hwnd);
-        SetForegroundWindow(hwnd);
-    }
-
     unsafe fn show_context_menu(hwnd: HWND) -> usize {
         let menu = CreatePopupMenu();
         if menu.is_null() {
@@ -285,39 +272,11 @@ mod platform {
     }
 
     unsafe fn show_and_notify() {
-        if let Some(hwnd) = current_app_hwnd() {
-            show_app_window(hwnd as _);
-        }
         notify_tray_event(TrayEvent::Show);
     }
 
     unsafe fn request_app_exit() {
         notify_tray_event(TrayEvent::Exit);
-
-        if let Some(hwnd) = current_app_hwnd() {
-            PostMessageW(hwnd as _, WM_CLOSE, 0, 0);
-        }
-    }
-
-    fn set_app_hwnd(hwnd: Option<isize>) {
-        if let Ok(mut value) = APP_HWND.get_or_init(|| Mutex::new(None)).lock() {
-            *value = hwnd;
-        }
-    }
-
-    fn current_app_hwnd() -> Option<isize> {
-        APP_HWND
-            .get()
-            .and_then(|hwnd| hwnd.lock().ok())
-            .and_then(|hwnd| *hwnd)
-    }
-
-    fn clear_app_hwnd() {
-        if let Some(hwnd) = APP_HWND.get() {
-            if let Ok(mut hwnd) = hwnd.lock() {
-                *hwnd = None;
-            }
-        }
     }
 
     fn notify_tray_event(event: TrayEvent) {

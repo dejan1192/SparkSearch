@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod actions;
 mod bookmarks;
 mod branding;
@@ -7,6 +9,7 @@ mod icons;
 mod index;
 mod search;
 mod shortcuts;
+mod theme;
 mod tray;
 
 use actions::{launch, target_from_raw_command, terminal_command_display, LaunchMode};
@@ -17,14 +20,18 @@ use icons::{AppIconCache, FaviconCache, FaviconLookup};
 use index::{index_entries, EntryKind, LauncherEntry};
 use search::{search, SearchResult};
 use shortcuts::ShortcutConfig;
+use theme::{AccentStyle, ThemeConfig};
 use tray::{TrayEvent, TrayIcon};
 
 const RESULT_LIMIT: usize = 10;
 const MAX_VISIBLE_RESULTS: usize = 6;
 const RESULT_ROW_HEIGHT: f32 = 56.0;
 const WINDOW_COLLAPSED_HEIGHT: f32 = 92.0;
-const WINDOW_EXPANDED_HEIGHT: f32 = 440.0;
+const WINDOW_EXPANDED_HEIGHT: f32 = 456.0;
 const WINDOW_WIDTH: f32 = 680.0;
+const RESULTS_TOP_SPACING: f32 = 10.0;
+const RESULT_ROW_SPACING: f32 = 2.0;
+const OPTIONS_PANEL_HEIGHT: f32 = 44.0;
 
 fn main() -> eframe::Result<()> {
     const ICON_SIZE: u32 = 64;
@@ -68,12 +75,14 @@ struct SparkRunApp {
     icon_cache: AppIconCache,
     favicon_cache: FaviconCache,
     run_history: RunHistory,
+    theme: ThemeConfig,
     suppress_hotkey_input_frames: u8,
     window_expanded: bool,
     center_window_frames: u8,
     ignore_focus_loss_frames: u8,
     window_visible: bool,
     exit_requested: bool,
+    show_options: bool,
 }
 
 impl SparkRunApp {
@@ -85,6 +94,7 @@ impl SparkRunApp {
         let loaded_history = RunHistory::load();
         let results = search(&entries, "", RESULT_LIMIT, &loaded_history.history);
         let loaded_shortcuts = ShortcutConfig::load_or_create();
+        let loaded_theme = ThemeConfig::load_or_create();
         let hwnd = native_window_handle(cc);
         let (global_hotkey, hotkey_status) =
             match GlobalHotkey::register_alt_d(cc.egui_ctx.clone(), hwnd) {
@@ -96,10 +106,11 @@ impl SparkRunApp {
             Err(error) => (None, error),
         };
         let status = format!(
-            "Indexed {} launch targets. {hotkey_status}. {tray_status}. {}. {}.",
+            "Indexed {} launch targets. {hotkey_status}. {tray_status}. {}. {}. {}.",
             entries.len(),
             loaded_shortcuts.status,
-            loaded_history.status
+            loaded_history.status,
+            loaded_theme.status,
         );
 
         Self {
@@ -116,12 +127,14 @@ impl SparkRunApp {
             icon_cache: AppIconCache::default(),
             favicon_cache: FaviconCache::default(),
             run_history: loaded_history.history,
+            theme: loaded_theme.theme,
             suppress_hotkey_input_frames: 0,
             window_expanded: false,
             center_window_frames: 4,
             ignore_focus_loss_frames: 4,
             window_visible: true,
             exit_requested: false,
+            show_options: false,
         }
     }
 
@@ -129,6 +142,26 @@ impl SparkRunApp {
         if terminal_command_display(&self.query).is_some() {
             self.results.clear();
             self.selected = 0;
+            return;
+        }
+        if let Some(filter) = history_query(&self.query) {
+            let mut shortcuts = self.shortcuts.all_shortcuts();
+            if !filter.is_empty() {
+                let q = filter.to_lowercase();
+                shortcuts.retain(|s| s.to_lowercase().contains(&q));
+            }
+            self.results = shortcuts
+                .into_iter()
+                .map(|shortcut| SearchResult {
+                    entry: LauncherEntry {
+                        name: shortcut.to_string(),
+                        kind: EntryKind::BuiltIn,
+                        target: target_from_raw_command(&shortcut, &self.shortcuts),
+                    },
+                    score: 0,
+                })
+                .collect();
+            self.selected = self.selected.min(self.results.len().saturating_sub(1));
             return;
         }
 
@@ -233,6 +266,7 @@ impl SparkRunApp {
                 TrayEvent::Show => self.bring_to_foreground(ctx),
                 TrayEvent::Exit => {
                     self.exit_requested = true;
+                    self.window_visible = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -322,22 +356,26 @@ impl SparkRunApp {
     }
 
     fn sync_window_size(&mut self, ctx: &egui::Context) {
-        let should_expand =
-            should_show_results(&self.query, &self.shortcuts) && !self.results.is_empty();
+        let visible_rows = visible_result_rows(&self.query, &self.shortcuts, self.results.len());
+        let should_expand = visible_rows > 0 || self.show_options;
+        let target_height = if should_expand {
+            expanded_window_height(visible_rows, self.show_options)
+        } else {
+            WINDOW_COLLAPSED_HEIGHT
+        };
 
         if should_expand == self.window_expanded {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                WINDOW_WIDTH,
+                target_height,
+            )));
             return;
         }
 
         self.window_expanded = should_expand;
-        let height = if should_expand {
-            WINDOW_EXPANDED_HEIGHT
-        } else {
-            WINDOW_COLLAPSED_HEIGHT
-        };
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             WINDOW_WIDTH,
-            height,
+            target_height,
         )));
     }
 
@@ -380,21 +418,35 @@ impl eframe::App for SparkRunApp {
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(20, 22, 27))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 42, 50)))
+                    .fill(egui::Color32::from_rgb(34, 38, 46))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 98, 118)))
                     .rounding(12.0)
                     .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                     .show(ui, |ui| {
-                        draw_window_chrome(ui, ctx);
+                        ui.set_min_height(ui.available_height());
+                        paint_glass_panel(ui);
 
-                        if draw_search_box(
+                        let search_box = draw_search_box(
                             ui,
                             &mut self.query,
                             &self.shortcuts,
                             &mut self.favicon_cache,
                             &mut self.focus_search,
-                        ) {
+                        );
+                        if search_box.toggled_options {
+                            self.show_options = !self.show_options;
+                        }
+                        if search_box.changed {
                             self.refresh_results();
+                        }
+
+                        if self.show_options {
+                            ui.add_space(8.0);
+                            if let Some(status) =
+                                draw_options_panel(ui, &mut self.theme, &mut self.focus_search)
+                            {
+                                self.status = status;
+                            }
                         }
 
                         let action_preview = action_preview(&self.query, &self.shortcuts);
@@ -414,6 +466,7 @@ impl eframe::App for SparkRunApp {
                                             ui,
                                             &preview,
                                             self.results.is_empty(),
+                                            self.theme.accent_style(),
                                             &mut self.favicon_cache,
                                             ctx,
                                         );
@@ -431,6 +484,7 @@ impl eframe::App for SparkRunApp {
                                             &result,
                                             selected,
                                             index,
+                                            self.theme.accent_style(),
                                             &mut self.icon_cache,
                                             &mut self.favicon_cache,
                                             ctx,
@@ -468,6 +522,7 @@ fn draw_result(
     result: &SearchResult,
     selected: bool,
     index: usize,
+    accent: AccentStyle,
     icon_cache: &mut AppIconCache,
     favicon_cache: &mut FaviconCache,
     ctx: &egui::Context,
@@ -479,20 +534,34 @@ fn draw_result(
     let painter = ui.painter_at(rect);
 
     let bg = if selected {
-        egui::Color32::from_rgb(32, 36, 44)
+        accent.selection_fill
     } else if response.hovered() {
-        egui::Color32::from_rgb(26, 29, 35)
+        egui::Color32::from_rgba_unmultiplied(22, 26, 34, 204)
     } else {
         egui::Color32::TRANSPARENT
     };
     painter.rect_filled(rect, 8.0, bg);
+    if selected || response.hovered() {
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            8.0,
+            egui::Stroke::new(
+                1.0,
+                if selected {
+                    accent.selection_stroke
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(228, 236, 248, 18)
+                },
+            ),
+        );
+    }
 
     if selected {
         let bar = egui::Rect::from_min_max(
             rect.left_top() + egui::vec2(4.0, 9.0),
             egui::pos2(rect.left() + 7.0, rect.bottom() - 9.0),
         );
-        painter.rect_filled(bar, 1.5, egui::Color32::from_rgb(82, 156, 255));
+        painter.rect_filled(bar, 1.5, accent.selection_bar);
     }
 
     let icon_center = egui::pos2(rect.left() + 40.0, rect.center().y);
@@ -517,8 +586,8 @@ fn draw_result(
     }
 
     let text_left = icon_center.x + 26.0;
-    let title_color = egui::Color32::from_rgb(236, 238, 244);
-    let subtitle_color = egui::Color32::from_rgb(138, 144, 158);
+    let title_color = egui::Color32::from_hex("#f5f5f5").unwrap();
+    let subtitle_color = egui::Color32::from_hex("#f5f5f5").unwrap();
 
     painter.text(
         egui::pos2(text_left, rect.center().y - 10.0),
@@ -540,13 +609,25 @@ fn draw_result(
             egui::pos2(rect.right() - 62.0, rect.center().y - 11.0),
             egui::pos2(rect.right() - 12.0, rect.center().y + 11.0),
         );
-        painter.rect_filled(pill, 4.0, egui::Color32::from_rgb(46, 50, 60));
+        painter.rect_filled(
+            pill,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(34, 40, 52, 216),
+        );
+        painter.rect_stroke(
+            pill.shrink(0.5),
+            4.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(232, 238, 248, 78),
+            ),
+        );
         painter.text(
             pill.center(),
             egui::Align2::CENTER_CENTER,
             format!("Alt+{}", index + 1),
-            egui::FontId::proportional(11.0),
-            egui::Color32::from_rgb(186, 192, 205),
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(244, 247, 252),
         );
     }
 
@@ -578,6 +659,11 @@ struct ActionPreview {
     icon: ActionIcon,
 }
 
+struct SearchBoxOutcome {
+    changed: bool,
+    toggled_options: bool,
+}
+
 enum ActionIcon {
     Terminal,
     Favicon { shortcut: String, url: String },
@@ -587,6 +673,7 @@ fn draw_action_result(
     ui: &mut egui::Ui,
     preview: &ActionPreview,
     selected: bool,
+    accent: AccentStyle,
     favicon_cache: &mut FaviconCache,
     ctx: &egui::Context,
 ) -> egui::Response {
@@ -597,20 +684,34 @@ fn draw_action_result(
     let painter = ui.painter_at(rect);
 
     let bg = if selected {
-        egui::Color32::from_rgb(32, 36, 44)
+        accent.selection_fill
     } else if response.hovered() {
-        egui::Color32::from_rgb(26, 29, 35)
+        egui::Color32::from_rgba_unmultiplied(22, 26, 34, 204)
     } else {
         egui::Color32::TRANSPARENT
     };
     painter.rect_filled(rect, 8.0, bg);
+    if selected || response.hovered() {
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            8.0,
+            egui::Stroke::new(
+                1.0,
+                if selected {
+                    accent.selection_stroke
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(228, 236, 248, 18)
+                },
+            ),
+        );
+    }
 
     if selected {
         let bar = egui::Rect::from_min_max(
             rect.left_top() + egui::vec2(4.0, 9.0),
             egui::pos2(rect.left() + 7.0, rect.bottom() - 9.0),
         );
-        painter.rect_filled(bar, 1.5, egui::Color32::from_rgb(82, 156, 255));
+        painter.rect_filled(bar, 1.5, accent.selection_bar);
     }
 
     let icon_center = egui::pos2(rect.left() + 40.0, rect.center().y);
@@ -656,20 +757,32 @@ fn draw_action_result(
         egui::Align2::LEFT_CENTER,
         &preview.subtitle,
         egui::FontId::proportional(12.0),
-        egui::Color32::from_rgb(138, 144, 158),
+        egui::Color32::from_hex("#f5f5f5").unwrap(),
     );
 
     let pill = egui::Rect::from_min_max(
         egui::pos2(rect.right() - 62.0, rect.center().y - 11.0),
         egui::pos2(rect.right() - 12.0, rect.center().y + 11.0),
     );
-    painter.rect_filled(pill, 4.0, egui::Color32::from_rgb(46, 50, 60));
+    painter.rect_filled(
+        pill,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(34, 40, 52, 216),
+    );
+    painter.rect_stroke(
+        pill.shrink(0.5),
+        4.0,
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(232, 238, 248, 78),
+        ),
+    );
     painter.text(
         pill.center(),
         egui::Align2::CENTER_CENTER,
         "Alt+1",
-        egui::FontId::proportional(11.0),
-        egui::Color32::from_rgb(186, 192, 205),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(244, 247, 252),
     );
 
     response
@@ -768,6 +881,7 @@ fn shortcut_service_name(shortcut: &str) -> String {
         "!y" => "YouTube".to_string(),
         "!gpt" => "ChatGPT".to_string(),
         "!claude" => "Claude".to_string(),
+        "!kimi" => "Kimi".to_string(),
         _ => shortcut.trim_start_matches('!').to_string(),
     }
 }
@@ -777,6 +891,9 @@ fn should_show_results(query: &str, shortcuts: &ShortcutConfig) -> bool {
 
     if query.is_empty() {
         return false;
+    }
+    if history_query(query).is_some() {
+        return true;
     }
 
     if terminal_command_display(query).is_some() {
@@ -798,20 +915,51 @@ fn should_show_results(query: &str, shortcuts: &ShortcutConfig) -> bool {
     query.chars().count() >= 2
 }
 
-fn draw_window_chrome(ui: &mut egui::Ui, ctx: &egui::Context) {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 6.0),
-        egui::Sense::click_and_drag(),
-    );
-
-    if response.drag_started() {
-        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+fn visible_result_rows(query: &str, shortcuts: &ShortcutConfig, results_len: usize) -> usize {
+    if !should_show_results(query, shortcuts) {
+        return 0;
     }
 
-    ui.painter().rect_filled(
-        egui::Rect::from_center_size(rect.center(), egui::vec2(46.0, 2.0)),
-        1.0,
-        egui::Color32::from_rgb(50, 54, 64),
+    usize::from(action_preview(query, shortcuts).is_some()) + results_len.min(MAX_VISIBLE_RESULTS)
+}
+
+fn expanded_window_height(visible_rows: usize, show_options: bool) -> f32 {
+    let row_count = visible_rows as f32;
+    let options_height = if show_options {
+        OPTIONS_PANEL_HEIGHT + 8.0
+    } else {
+        0.0
+    };
+    let height = WINDOW_COLLAPSED_HEIGHT
+        + options_height
+        + if visible_rows > 0 {
+            RESULTS_TOP_SPACING
+        } else {
+            0.0
+        }
+        + (row_count * RESULT_ROW_HEIGHT)
+        + ((row_count - 1.0).max(0.0) * RESULT_ROW_SPACING);
+    height.min(WINDOW_EXPANDED_HEIGHT)
+}
+
+fn paint_glass_panel(ui: &egui::Ui) {
+    let rect = ui.max_rect();
+    let painter = ui.painter();
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            rect.min + egui::vec2(1.0, 1.0),
+            egui::pos2(rect.max.x - 1.0, rect.min.y + 18.0),
+        ),
+        12.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + 1.0, rect.center().y - 2.0),
+            rect.max - egui::vec2(1.0, 1.0),
+        ),
+        12.0,
+        egui::Color32::from_rgba_unmultiplied(10, 12, 18, 14),
     );
 }
 
@@ -881,6 +1029,15 @@ fn subtitle_for(entry: &LauncherEntry) -> String {
         label.to_string()
     } else {
         format!("{label} — {target}")
+    }
+}
+
+fn history_query(query: &str) -> Option<&str> {
+    let trimmed = query.trim_start();
+    if trimmed == "*" {
+        Some("")
+    } else {
+        trimmed.strip_prefix("* ").map(str::trim)
     }
 }
 
@@ -958,7 +1115,7 @@ fn draw_search_box(
     shortcuts: &ShortcutConfig,
     favicon_cache: &mut FaviconCache,
     focus_search: &mut bool,
-) -> bool {
+) -> SearchBoxOutcome {
     let Some(shortcut) = shortcuts.shortcut_prefix(query).map(str::to_string) else {
         return draw_plain_search_box(ui, query, focus_search);
     };
@@ -988,16 +1145,25 @@ fn set_search_cursor_end(ctx: &egui::Context, value: &str) {
     ctx.memory_mut(|memory| memory.request_focus(id));
 }
 
-fn draw_plain_search_box(ui: &mut egui::Ui, query: &mut String, focus_search: &mut bool) -> bool {
+fn draw_plain_search_box(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    focus_search: &mut bool,
+) -> SearchBoxOutcome {
     let mut changed = false;
+    let mut toggled_options = false;
 
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(30, 32, 37))
+        .fill(egui::Color32::from_rgba_unmultiplied(34, 38, 46, 232))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(214, 223, 240, 36),
+        ))
         .rounding(10.0)
         .inner_margin(egui::Margin::symmetric(16.0, 10.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let right_reserve = 88.0;
+                let right_reserve = 118.0;
                 let text_width = (ui.available_width() - right_reserve).max(120.0);
 
                 let response = ui.add_sized(
@@ -1016,7 +1182,7 @@ fn draw_plain_search_box(ui: &mut egui::Ui, query: &mut String, focus_search: &m
 
                 changed = response.changed();
 
-                draw_search_trailing(
+                toggled_options = draw_search_trailing(
                     ui,
                     query.is_empty(),
                     terminal_command_display(query).is_some(),
@@ -1024,7 +1190,10 @@ fn draw_plain_search_box(ui: &mut egui::Ui, query: &mut String, focus_search: &m
             });
         });
 
-    changed
+    SearchBoxOutcome {
+        changed,
+        toggled_options,
+    }
 }
 
 fn draw_shortcut_search_box(
@@ -1034,8 +1203,9 @@ fn draw_shortcut_search_box(
     shortcuts: &ShortcutConfig,
     favicon_cache: &mut FaviconCache,
     focus_search: &mut bool,
-) -> bool {
+) -> SearchBoxOutcome {
     let mut changed = false;
+    let mut toggled_options = false;
     let mut text_after_shortcut = query
         .split_once(char::is_whitespace)
         .map(|(_, value)| value.trim_start().to_string())
@@ -1052,18 +1222,28 @@ fn draw_shortcut_search_box(
         query.clear();
         *focus_search = true;
         set_search_cursor_end(ui.ctx(), query);
-        return true;
+        return SearchBoxOutcome {
+            changed: true,
+            toggled_options: false,
+        };
     }
 
     if has_focus && was_empty && backspace {
         *query = delete_last_char(shortcut);
         *focus_search = true;
         set_search_cursor_end(ui.ctx(), query);
-        return true;
+        return SearchBoxOutcome {
+            changed: true,
+            toggled_options: false,
+        };
     }
 
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(30, 32, 37))
+        .fill(egui::Color32::from_rgba_unmultiplied(34, 38, 46, 232))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(214, 223, 240, 36),
+        ))
         .rounding(10.0)
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
@@ -1071,7 +1251,7 @@ fn draw_shortcut_search_box(
                 let chip_ctx = ui.ctx().clone();
                 draw_shortcut_chip(ui, shortcut, shortcuts, favicon_cache, &chip_ctx);
 
-                let right_reserve = 88.0;
+                let right_reserve = 118.0;
                 let text_width = (ui.available_width() - right_reserve).max(100.0);
 
                 let response = ui.add_sized(
@@ -1093,19 +1273,23 @@ fn draw_shortcut_search_box(
                     changed = true;
                 }
 
-                draw_search_trailing(ui, text_after_shortcut.is_empty(), false);
+                toggled_options = draw_search_trailing(ui, text_after_shortcut.is_empty(), false);
             });
         });
 
-    changed
+    SearchBoxOutcome {
+        changed,
+        toggled_options,
+    }
 }
 
-fn draw_search_trailing(ui: &mut egui::Ui, query_is_empty: bool, terminal_mode: bool) {
+fn draw_search_trailing(ui: &mut egui::Ui, query_is_empty: bool, terminal_mode: bool) -> bool {
     let clock_alpha = ui.ctx().animate_bool_with_time(
         egui::Id::new("spark_clock_alpha"),
         query_is_empty && !terminal_mode,
         0.18,
     );
+    let mut toggled_options = false;
 
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if terminal_mode {
@@ -1113,6 +1297,8 @@ fn draw_search_trailing(ui: &mut egui::Ui, query_is_empty: bool, terminal_mode: 
         } else {
             draw_magnifier_icon(ui, 18.0);
         }
+        ui.add_space(10.0);
+        toggled_options = draw_options_toggle(ui);
         if clock_alpha > 0.01 {
             ui.add_space(10.0);
             let alpha_byte = (clock_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -1125,6 +1311,97 @@ fn draw_search_trailing(ui: &mut egui::Ui, query_is_empty: bool, terminal_mode: 
             );
         }
     });
+
+    toggled_options
+}
+
+fn draw_options_toggle(ui: &mut egui::Ui) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let stroke_color = if response.hovered() {
+        egui::Color32::from_rgb(226, 232, 242)
+    } else {
+        egui::Color32::from_rgb(170, 178, 195)
+    };
+    let stroke = egui::Stroke::new(1.6, stroke_color);
+    let center = rect.center();
+    painter.circle_stroke(center, 6.5, stroke);
+    painter.circle_filled(center, 1.7, stroke_color);
+    for angle in [
+        0.0_f32,
+        std::f32::consts::FRAC_PI_4,
+        std::f32::consts::FRAC_PI_2,
+        std::f32::consts::PI * 0.75,
+    ] {
+        let dir = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment([center + dir * 7.5, center + dir * 10.0], stroke);
+        painter.line_segment([center - dir * 7.5, center - dir * 10.0], stroke);
+    }
+    response.on_hover_text("Accent options").clicked()
+}
+
+fn draw_options_panel(
+    ui: &mut egui::Ui,
+    theme: &mut ThemeConfig,
+    focus_search: &mut bool,
+) -> Option<String> {
+    let mut status = None;
+
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(214, 223, 240, 28),
+        ))
+        .rounding(9.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .show(ui, |ui| {
+            ui.set_height(OPTIONS_PANEL_HEIGHT);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Accent")
+                        .color(egui::Color32::from_rgb(198, 204, 216))
+                        .size(13.0),
+                );
+                ui.add_space(8.0);
+
+                for preset in ThemeConfig::presets() {
+                    let preset = *preset;
+                    let selected = theme.accent() == preset;
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                    let painter = ui.painter_at(rect);
+                    painter.circle_filled(rect.center(), 7.0, preset.swatch());
+                    painter.circle_stroke(
+                        rect.center(),
+                        8.5,
+                        egui::Stroke::new(
+                            if selected { 2.0 } else { 1.0 },
+                            if selected {
+                                egui::Color32::from_rgb(244, 247, 252)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 54)
+                            },
+                        ),
+                    );
+
+                    if response.clicked() {
+                        match theme.set_accent(preset) {
+                            Ok(()) => {
+                                *focus_search = true;
+                                status = Some(format!("Accent set to {}", preset.label()));
+                            }
+                            Err(error) => status = Some(format!("Could not save theme: {error}")),
+                        }
+                    }
+
+                    response.on_hover_text(preset.label());
+                    ui.add_space(6.0);
+                }
+            });
+        });
+
+    status
 }
 
 fn draw_terminal_trailing_icon(ui: &mut egui::Ui, size: f32) {
